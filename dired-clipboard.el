@@ -96,8 +96,13 @@ powershell, pwsh.exe and pwsh."
 (defvar dired-clipboard--wl-copy-process nil
   "Current wl-copy process used to own the Wayland clipboard.")
 
+(defconst dired-clipboard--file-uri-path-chars
+  (append url-unreserved-chars '(?/ ?:))
+  "Characters left unescaped in file URI paths.")
+
 (defconst dired-clipboard--windows-set-file-drop-script
   "$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms
 $files = New-Object System.Collections.Specialized.StringCollection
 foreach ($line in ([Console]::In.ReadToEnd() -split \"`n\")) {
@@ -108,11 +113,16 @@ foreach ($line in ([Console]::In.ReadToEnd() -split \"`n\")) {
   }
 }
 if ($files.Count -eq 0) { exit 1 }
-[System.Windows.Forms.Clipboard]::SetFileDropList($files)"
+$data = New-Object System.Windows.Forms.DataObject
+$data.SetFileDropList($files)
+$effect = New-Object System.IO.MemoryStream(,[BitConverter]::GetBytes([UInt32]1))
+$data.SetData('Preferred DropEffect', $effect)
+[System.Windows.Forms.Clipboard]::SetDataObject($data, $true)"
   "PowerShell script that sets the Windows FileDrop clipboard.")
 
 (defconst dired-clipboard--windows-get-file-drop-script
   "$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms
 if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) {
   foreach ($path in [System.Windows.Forms.Clipboard]::GetFileDropList()) {
@@ -195,7 +205,11 @@ return paths as text"
   "Return newline-separated base64 UTF-8 TEXT as strings."
   (let (strings)
     (dolist (line (dired-clipboard--lines text) (nreverse strings))
-      (push (dired-clipboard--base64-decode-utf8 line) strings))))
+      (when (and (zerop (% (length line) 4))
+                 (string-match-p "\\`[[:alnum:]+/=]+\\'" line))
+        (when-let ((string (ignore-errors
+                             (dired-clipboard--base64-decode-utf8 line))))
+          (push string strings))))))
 
 (defun dired-clipboard--powershell-program ()
   "Return the PowerShell executable used for Windows clipboard integration."
@@ -214,7 +228,8 @@ return paths as text"
   (when-let ((program (dired-clipboard--powershell-program)))
     (dired-clipboard--call-process
      program input
-     "-NoProfile" "-NonInteractive" "-STA" "-EncodedCommand"
+     "-NoLogo" "-NoProfile" "-NonInteractive" "-STA"
+     "-OutputFormat" "Text" "-EncodedCommand"
      (dired-clipboard--powershell-encoded-command script))))
 
 (defun dired-clipboard--call-osascript (script &rest args)
@@ -372,9 +387,16 @@ When PREDICATE is non-nil, call the saved predicate instead."
 (defun dired-clipboard--file-to-uri (file)
   "Return a file URI for local FILE."
   (let ((path (expand-file-name file)))
-    (concat "file://"
-            (unless (string-prefix-p "/" path) "/")
-            (url-encode-url path))))
+    (if (and (eq system-type 'windows-nt)
+             (string-match "\\`//\\([^/]+\\)\\(/.*\\)" path))
+        (concat "file://"
+                (match-string 1 path)
+                (url-hexify-string
+                 (match-string 2 path)
+                 dired-clipboard--file-uri-path-chars))
+      (concat "file://"
+              (unless (string-prefix-p "/" path) "/")
+              (url-hexify-string path dired-clipboard--file-uri-path-chars)))))
 
 (defun dired-clipboard--uri-to-file (uri)
   "Return a local file name from file URI."
@@ -383,13 +405,19 @@ When PREDICATE is non-nil, call the saved predicate instead."
            (host (url-host url))
            (path (url-filename url)))
       (when (and path
-                 (or (null host)
+                 (or (eq system-type 'windows-nt)
+                     (null host)
                      (string-empty-p host)
                      (string= host "localhost")))
         (setq path (url-unhex-string path 'utf-8))
-        (when (and (eq system-type 'windows-nt)
-                   (string-match-p "\\`/[[:alpha:]]:" path))
-          (setq path (substring path 1)))
+        (when (eq system-type 'windows-nt)
+          (cond
+           ((and host
+                 (not (string-empty-p host))
+                 (not (string= host "localhost")))
+            (setq path (concat "//" host path)))
+           ((string-match-p "\\`/[[:alpha:]]:" path)
+            (setq path (substring path 1)))))
         path))))
 
 (defun dired-clipboard--parse-uri-list (text)
@@ -404,6 +432,8 @@ When PREDICATE is non-nil, call the saved predicate instead."
 (defun dired-clipboard--parse-gnome-files (text)
   "Return local file names from GNOME/Nautilus clipboard TEXT."
   (let ((lines (dired-clipboard--lines text)))
+    (when (string= (car lines) "x-special/nautilus-clipboard")
+      (setq lines (cdr lines)))
     (when (member (car lines) '("copy" "cut"))
       (dired-clipboard--parse-uri-list
        (mapconcat #'identity (cdr lines) "\n")))))
@@ -493,6 +523,7 @@ When PREDICATE is non-nil, call the saved predicate instead."
                    (dired-clipboard--current-kill)))
          (files (or native-files
                     (dired-clipboard--parse-gnome-files gnome)
+                    (dired-clipboard--parse-gnome-files text)
                     (dired-clipboard--parse-uri-list uri-list)
                     (dired-clipboard--parse-path-list text))))
     (dired-clipboard--existing-files files)))
@@ -507,20 +538,24 @@ When PREDICATE is non-nil, call the saved predicate instead."
          (gnome-list (when local-uris
                        ;; Nautilus rejects empty lines in this MIME payload.
                        (concat "copy\n" (mapconcat #'identity local-uris "\n"))))
-         (selection (copy-sequence text)))
-    (kill-new text)
+         (selection (copy-sequence text))
+         clipboard-owned)
     (when local-uris
       (dired-clipboard--install-selection-converters)
       (add-text-properties
        0 (length selection)
        `(text/uri-list ,uri-list
-         x-special/gnome-copied-files ,gnome-list)
+                       x-special/gnome-copied-files ,gnome-list)
        selection))
-    (if (and local-uris
-             (or (dired-clipboard--set-native-file-clipboard local-files)
-                 (dired-clipboard--set-wayland-file-clipboard gnome-list uri-list)))
-        nil
+    (setq clipboard-owned
+          (and local-uris
+               (or (dired-clipboard--set-native-file-clipboard local-files)
+                   (dired-clipboard--set-wayland-file-clipboard gnome-list uri-list))))
+    (if clipboard-owned
+        (let ((interprogram-cut-function nil))
+          (kill-new text))
       (dired-clipboard--stop-wl-copy)
+      (kill-new text)
       (when (fboundp 'gui-set-selection)
         (ignore-errors
           (gui-set-selection 'CLIPBOARD selection))))))
