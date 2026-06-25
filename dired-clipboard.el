@@ -48,6 +48,17 @@ The value is bound to `dired-recursive-copies' while pasting."
                  (character :tag "Marker character"))
   :group 'dired-clipboard)
 
+(defcustom dired-clipboard-existing-file-policy 'rename
+  "How `dired-clipboard-paste' handles existing destination files.
+The value `rename' pastes using the first available name like
+\"file copy.txt\" or \"file copy 2.txt\".
+
+The value `error' keeps Dired's default behavior, which signals an
+error when the destination already exists."
+  :type '(choice (const :tag "Paste with a unique name" rename)
+                 (const :tag "Signal an error" error))
+  :group 'dired-clipboard)
+
 (defcustom dired-clipboard-use-wl-copy t
   "Whether to use wl-copy for file clipboard data under PGTK/Wayland.
 The PGTK clipboard backend advertises plain text targets for
@@ -739,6 +750,39 @@ Return the backend name that claimed the clipboard."
        (mark t)
        (> (region-end) (region-beginning))))
 
+(defun dired-clipboard--copy-name (file index)
+  "Return a copy-style name for FILE at numeric INDEX."
+  (let* ((directory-p (file-directory-p file))
+         (name (file-name-nondirectory (directory-file-name file)))
+         (root (if directory-p name (file-name-sans-extension name)))
+         (extension (if directory-p "" (file-name-extension name t)))
+         (suffix (if (= index 1) " copy" (format " copy %d" index))))
+    (concat root suffix extension)))
+
+(defun dired-clipboard--unique-destination (file directory)
+  "Return a destination for FILE in DIRECTORY that does not exist."
+  (let* ((target-directory (file-name-as-directory directory))
+         (name (file-name-nondirectory (directory-file-name file)))
+         (destination (expand-file-name name target-directory))
+         (index 1))
+    (while (file-exists-p destination)
+      (setq destination
+            (expand-file-name
+             (dired-clipboard--copy-name file index)
+             target-directory))
+      (setq index (1+ index)))
+    destination))
+
+(defun dired-clipboard--paste-destination (file directory)
+  "Return the paste destination for FILE in DIRECTORY."
+  (let ((destination
+         (expand-file-name
+          (file-name-nondirectory (directory-file-name file))
+          directory)))
+    (pcase dired-clipboard-existing-file-policy
+      ('rename (dired-clipboard--unique-destination file directory))
+      (_ destination))))
+
 ;;;###autoload
 (defun dired-clipboard-copy ()
   "Copy marked Dired files/directories, or current file, to the clipboard."
@@ -769,9 +813,7 @@ Return the backend name that claimed the clipboard."
      "Paste"
      files
      (lambda (from)
-       (expand-file-name
-        (file-name-nondirectory (directory-file-name from))
-        target))
+       (dired-clipboard--paste-destination from target))
      dired-clipboard-keep-marker)))
 
 (defun dired-clipboard--disabled-in-wdired ()

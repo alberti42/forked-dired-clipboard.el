@@ -62,6 +62,48 @@
                          (list existing)))
         (delete-file existing)))))
 
+(ert-deftest dired-clipboard-paste-destination-renames-existing-file ()
+  "Paste destination uses a copy-style name when a file exists."
+  (let* ((directory (make-temp-file "dired-clipboard-test" t))
+         (source (expand-file-name "example.txt" directory))
+         (copy (expand-file-name "example copy.txt" directory))
+         (second-copy (expand-file-name "example copy 2.txt" directory))
+         (dired-clipboard-existing-file-policy 'rename))
+    (unwind-protect
+        (progn
+          (write-region "" nil source)
+          (should (equal (dired-clipboard--paste-destination source directory)
+                         copy))
+          (write-region "" nil copy)
+          (should (equal (dired-clipboard--paste-destination source directory)
+                         second-copy)))
+      (delete-directory directory t))))
+
+(ert-deftest dired-clipboard-paste-destination-renames-existing-directory ()
+  "Paste destination uses a copy-style name for directories."
+  (let* ((directory (make-temp-file "dired-clipboard-test" t))
+         (source (expand-file-name "example.dir" directory))
+         (copy (expand-file-name "example.dir copy" directory))
+         (dired-clipboard-existing-file-policy 'rename))
+    (unwind-protect
+        (progn
+          (make-directory source)
+          (should (equal (dired-clipboard--paste-destination source directory)
+                         copy)))
+      (delete-directory directory t))))
+
+(ert-deftest dired-clipboard-paste-destination-error-policy-keeps-name ()
+  "The error policy leaves the destination name unchanged."
+  (let* ((directory (make-temp-file "dired-clipboard-test" t))
+         (source (expand-file-name "example.txt" directory))
+         (dired-clipboard-existing-file-policy 'error))
+    (unwind-protect
+        (progn
+          (write-region "" nil source)
+          (should (equal (dired-clipboard--paste-destination source directory)
+                         source)))
+      (delete-directory directory t))))
+
 (ert-deftest dired-clipboard-wayland-target-detects-mate ()
   "MATE desktops use Caja's copied-files MIME target."
   (let ((dired-clipboard-wayland-target 'auto)

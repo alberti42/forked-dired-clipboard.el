@@ -14,6 +14,14 @@ It lets you use familiar clipboard keys in Dired:
 The package also tries to interoperate with desktop file managers by using
 native file clipboard formats where practical.
 
+* Demo
+
+[[file:assets/dired-clipboard-demo-1.gif]]
+
+[[file:assets/dired-clipboard-demo-2.gif]]
+
+[[file:assets/dired-clipboard-demo-3.gif]]
+
 * Requirements
 
 - Emacs 30.1 or later
@@ -28,18 +36,18 @@ Put ~dired-clipboard.el~ somewhere in your ~load-path~, then enable the minor
 mode in Dired buffers:
 
 #+begin_src emacs-lisp
-(add-to-list 'load-path "/path/to/dired-clipboard.el")
-(require 'dired-clipboard)
+  (add-to-list 'load-path "/path/to/dired-clipboard.el")
+  (require 'dired-clipboard)
 
-(add-hook 'dired-mode-hook #'dired-clipboard-mode)
+  (add-hook 'dired-mode-hook #'dired-clipboard-mode)
 #+end_src
 
 With ~use-package~:
 
 #+begin_src emacs-lisp
-(use-package dired-clipboard
-  :load-path "/path/to/dired-clipboard.el"
-  :hook (dired-mode . dired-clipboard-mode))
+  (use-package dired-clipboard
+    :load-path "/path/to/dired-clipboard.el"
+    :hook (dired-mode . dired-clipboard-mode))
 #+end_src
 
 * Usage
@@ -82,6 +90,8 @@ by desktop file managers.  When ~wl-copy~ is available,
 
 - ~dired-clipboard-recursive-copies~ controls how directory copies are handled.
 - ~dired-clipboard-keep-marker~ controls the marker used for pasted files.
+- ~dired-clipboard-existing-file-policy~ controls how paste handles existing
+  destination files.
 - ~dired-clipboard-use-wl-copy~ enables or disables ~wl-copy~ integration.
 - ~dired-clipboard-wayland-target~ selects the Wayland file clipboard MIME
   target.
