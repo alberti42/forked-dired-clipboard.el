@@ -6,10 +6,12 @@ It lets you use familiar clipboard keys in Dired:
 
 - ~M-w~ copies marked files and directories, or the file at point when no
   files are marked.
+- ~C-w~ cuts marked files and directories, or the file at point when no
+  files are marked.
 - ~C-y~ pastes files and directories from the clipboard into the current Dired
   directory.
-- ~M-w~ keeps its normal behavior while the region is active.
-- ~M-w~ and ~C-y~ keep their normal editing behavior in WDired.
+- ~M-w~ and ~C-w~ keep their normal behavior while the region is active.
+- ~M-w~, ~C-w~ and ~C-y~ keep their normal editing behavior in WDired.
 
 The package also tries to interoperate with desktop file managers by using
 native file clipboard formats where practical.
@@ -55,9 +57,11 @@ With ~use-package~:
 In a Dired buffer:
 
 - Mark one or more files, then press ~M-w~ to copy them.
+- Mark one or more files, then press ~C-w~ to cut them.
 - Press ~M-w~ on an unmarked file to copy the file at point.
+- Press ~C-w~ on an unmarked file to cut the file at point.
 - Open another Dired directory and press ~C-y~ to copy the clipboard files
-  there.
+  there, or move them there after ~C-w~.
 
 When the clipboard contains files copied from a supported desktop file manager,
 ~C-y~ can paste those files into the current Dired directory.
@@ -67,9 +71,10 @@ When the clipboard contains files copied from a supported desktop file manager,
 ~dired-clipboard~ supports these clipboard formats:
 
 - Plain newline-separated file names for Dired-to-Dired copy and paste
+- Dired-to-Dired cut and paste through ~C-w~ and ~C-y~
 - ~text/uri-list~
-- ~x-special/gnome-copied-files~
-- ~x-special/mate-copied-files~
+- ~x-special/gnome-copied-files~ with copy/cut operations
+- ~x-special/mate-copied-files~ with copy/cut operations
 - Windows Explorer FileDrop, through PowerShell/.NET
 - macOS Finder file URLs, through ~osascript~ and AppleScriptObjC
 
@@ -77,7 +82,8 @@ OS/environment-specific file clipboard support is implemented as ordered
 backends.  Built-in backends are tried only when their capabilities are
 available:
 
-- ~windows~ for Explorer FileDrop on Windows
+- ~windows~ for Explorer FileDrop on Windows, including copy/move
+  ~Preferred DropEffect~ metadata
 - ~macos~ for Finder/NSPasteboard file URLs on macOS
 - ~wayland~ for ~wl-copy~ file MIME data on PGTK/Wayland, including
   GNOME/Nautilus and MATE/Caja MIME targets where detected
@@ -115,6 +121,15 @@ best-effort and does not try to provide transparent remote file transfer.
 
 For predictable behavior, use this package for local Dired buffers and local
 desktop file managers.
+
+On Windows, Explorer cut/copy state is represented with ~Preferred DropEffect~,
+so Explorer-to-Dired and Dired-to-Explorer move operations can work when the
+target application honors that clipboard metadata.
+
+On macOS, Finder exposes file URLs on the pasteboard but does not provide the
+same general-purpose cut marker used by Windows Explorer or GNOME/MATE file
+managers.  Dired-to-Dired ~C-w~ still moves files, while Finder interoperability
+uses the standard file URL pasteboard behavior.
 
 * License
 

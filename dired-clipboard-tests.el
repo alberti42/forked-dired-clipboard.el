@@ -5,6 +5,7 @@
 ;;; Code:
 
 (require 'ert)
+(require 'cl-lib)
 (require 'dired-clipboard)
 
 (ert-deftest dired-clipboard-copy-backends-skip-unavailable ()
@@ -61,6 +62,104 @@
           (should (equal (dired-clipboard--files-from-file-backends)
                          (list existing)))
         (delete-file existing)))))
+
+(ert-deftest dired-clipboard-cut-payload-records-operation ()
+  "Cut payloads advertise cut semantics where supported."
+  (let ((file (make-temp-file "dired-clipboard-test")))
+    (unwind-protect
+        (let* ((uri (dired-clipboard--file-to-uri file))
+               (payload (dired-clipboard--file-clipboard-payload
+                         (list file) 'cut))
+               (text (plist-get payload :text))
+               (copied-files-list (plist-get payload :copied-files-list)))
+          (should (eq (plist-get payload :operation) 'cut))
+          (should (eq (get-text-property
+                       0 'dired-clipboard-operation text)
+                      'cut))
+          (should (equal copied-files-list
+                         (concat "cut\n" uri)))
+          (should (equal (dired-clipboard--parse-copied-files-content
+                          copied-files-list)
+                         (list :operation 'cut :files (list file)))))
+      (delete-file file))))
+
+(ert-deftest dired-clipboard-content-from-kill-ring-preserves-cut ()
+  "Dired-to-Dired cut falls back through the kill ring."
+  (let* ((file (make-temp-file "dired-clipboard-test"))
+         (text (copy-sequence file))
+         (kill-ring-yank-pointer nil))
+    (unwind-protect
+        (progn
+          (add-text-properties
+           0 (length text)
+           '(dired-clipboard-operation cut)
+           text)
+          (let ((kill-ring (list text))
+                (dired-clipboard-file-clipboard-backends nil))
+            (should (equal (dired-clipboard--content-from-clipboard)
+                           (list :operation 'cut :files (list file))))))
+      (delete-file file))))
+
+(ert-deftest dired-clipboard-backend-content-preserves-internal-cut ()
+  "Native backend files still use cut when the kill ring matches them."
+  (let* ((file (make-temp-file "dired-clipboard-test"))
+         (text (copy-sequence file))
+         (kill-ring-yank-pointer nil)
+         (dired-clipboard-file-clipboard-backends '(backend))
+         (dired-clipboard-file-clipboard-backend-alist
+          (list (list 'backend :paste (lambda () (list file))))))
+    (unwind-protect
+        (progn
+          (add-text-properties
+           0 (length text)
+           '(dired-clipboard-operation cut)
+           text)
+          (let ((kill-ring (list text)))
+            (should (equal (dired-clipboard--content-from-clipboard)
+                           (list :operation 'cut :files (list file))))))
+      (delete-file file))))
+
+(ert-deftest dired-clipboard-windows-drop-effect-round-trips-cut ()
+  "Windows Preferred DropEffect maps move to cut."
+  (let* ((file (make-temp-file "dired-clipboard-test"))
+         (output (concat "__DROPEFFECT:2\n"
+                         (dired-clipboard--base64-encode-utf8 file)
+                         "\n")))
+    (unwind-protect
+        (progn
+          (should (= (dired-clipboard--windows-drop-effect 'copy) 1))
+          (should (= (dired-clipboard--windows-drop-effect 'cut) 2))
+          (should (eq (dired-clipboard--windows-operation-from-drop-effect 1)
+                      'copy))
+          (should (eq (dired-clipboard--windows-operation-from-drop-effect 2)
+                      'cut))
+          (should (equal (dired-clipboard--decode-base64-lines output)
+                         (list file)))
+          (should (equal (dired-clipboard--clipboard-content
+                          (dired-clipboard--decode-base64-lines output)
+                          (dired-clipboard--windows-operation-from-drop-effect
+                           (dired-clipboard--windows-drop-effect-from-output
+                            output)))
+                         (list :operation 'cut :files (list file)))))
+      (delete-file file))))
+
+(ert-deftest dired-clipboard-windows-set-clipboard-uses-cut-effect ()
+  "Windows clipboard setup receives DROPEFFECT_MOVE for cut payloads."
+  (let* ((file (make-temp-file "dired-clipboard-test"))
+         (system-type 'windows-nt)
+         (dired-clipboard-use-native-file-clipboard t)
+         (captured-input nil))
+    (unwind-protect
+        (cl-letf (((symbol-function #'dired-clipboard--powershell-program)
+                   (lambda () "powershell"))
+                  ((symbol-function #'dired-clipboard--call-powershell)
+                   (lambda (_script input)
+                     (setq captured-input input)
+                     "ok")))
+          (should (dired-clipboard--set-windows-file-clipboard
+                   (list file) 'cut))
+          (should (string-prefix-p "effect=2\n" captured-input)))
+      (delete-file file))))
 
 (ert-deftest dired-clipboard-paste-destination-renames-existing-file ()
   "Paste destination uses a copy-style name when a file exists."

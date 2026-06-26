@@ -11,9 +11,11 @@
 ;;
 ;; - M-w copies marked files/directories to the clipboard, or the file at
 ;;   point when no files are marked.
+;; - C-w cuts marked files/directories to the clipboard, or the file at
+;;   point when no files are marked.
 ;; - C-y pastes files/directories from the clipboard into the current Dired directory.
-;; - M-w falls back to the default binding while the region is active.
-;; - M-w/C-y fall back to the default bindings while editing file names in WDired.
+;; - M-w/C-w fall back to the default bindings while the region is active.
+;; - M-w/C-w/C-y fall back to the default bindings while editing file names in WDired.
 
 ;;; Code:
 
@@ -137,7 +139,8 @@ powershell, pwsh.exe and pwsh."
      :label "Windows Explorer FileDrop"
      :available dired-clipboard--windows-backend-available-p
      :copy dired-clipboard--copy-windows-file-clipboard
-     :paste dired-clipboard--windows-files-from-clipboard)
+     :paste dired-clipboard--windows-files-from-clipboard
+     :paste-content dired-clipboard--windows-content-from-clipboard)
     (macos
      :label "macOS Finder NSPasteboard"
      :available dired-clipboard--macos-backend-available-p
@@ -152,12 +155,14 @@ Each entry is (NAME . PLIST).  PLIST may contain these keys:
 
 :label is a human-readable backend name.
 :available is an optional predicate called with OPERATION and
-  PAYLOAD.  OPERATION is either `copy' or `paste'.  PAYLOAD is the
-  file clipboard payload plist for copy operations and nil for
+  PAYLOAD.  OPERATION is `copy', `paste' or `paste-content'.  PAYLOAD
+  is the file clipboard payload plist for copy operations and nil for
   paste operations.
 :copy is a function called with the file clipboard payload plist.
 :paste is a function called with no arguments and returning file
   names represented by the current OS clipboard.
+:paste-content is a function called with no arguments and returning a
+  plist with :operation and :files represented by the current OS clipboard.
 
 Users can add entries here and include their names in
 `dired-clipboard-file-clipboard-backends'.")
@@ -174,14 +179,19 @@ $files = New-Object System.Collections.Specialized.StringCollection
 foreach ($line in ([Console]::In.ReadToEnd() -split \"`n\")) {
   $line = $line.Trim()
   if ($line.Length -gt 0) {
-    $path = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line))
-    [void] $files.Add($path)
+    if ($line -match '^effect=([0-9]+)$') {
+      $effectValue = [UInt32]$Matches[1]
+    } else {
+      $path = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line))
+      [void] $files.Add($path)
+    }
   }
 }
 if ($files.Count -eq 0) { exit 1 }
+if ($null -eq $effectValue) { $effectValue = [UInt32]1 }
 $data = New-Object System.Windows.Forms.DataObject
 $data.SetFileDropList($files)
-$effect = New-Object System.IO.MemoryStream(,[BitConverter]::GetBytes([UInt32]1))
+$effect = New-Object System.IO.MemoryStream(,[BitConverter]::GetBytes($effectValue))
 $data.SetData('Preferred DropEffect', $effect)
 [System.Windows.Forms.Clipboard]::SetDataObject($data, $true)"
   "PowerShell script that sets the Windows FileDrop clipboard.")
@@ -190,6 +200,20 @@ $data.SetData('Preferred DropEffect', $effect)
   "$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 Add-Type -AssemblyName System.Windows.Forms
+$data = [System.Windows.Forms.Clipboard]::GetDataObject()
+if ($null -ne $data -and $data.GetDataPresent('Preferred DropEffect')) {
+  $effect = $data.GetData('Preferred DropEffect')
+  if ($effect -is [System.IO.MemoryStream]) {
+    $bytes = $effect.ToArray()
+  } elseif ($effect -is [byte[]]) {
+    $bytes = $effect
+  } else {
+    $bytes = $null
+  }
+  if ($null -ne $bytes -and $bytes.Length -ge 4) {
+    [Console]::Out.WriteLine('__DROPEFFECT:' + [BitConverter]::ToUInt32($bytes, 0))
+  }
+}
 if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) {
   foreach ($path in [System.Windows.Forms.Clipboard]::GetFileDropList()) {
     [Console]::Out.WriteLine(
@@ -515,16 +539,21 @@ GNOME/Nautilus-style targets, including Caja's MATE target."
         (when-let ((file (dired-clipboard--uri-to-file line)))
           (push file files))))))
 
-(defun dired-clipboard--parse-copied-files (text)
-  "Return local file names from copy/cut plus file URI clipboard TEXT."
+(defun dired-clipboard--parse-copied-files-content (text)
+  "Return a plist for copy/cut plus file URI clipboard TEXT."
   (let ((lines (dired-clipboard--lines text)))
     (when (member (car lines)
                   '("x-special/nautilus-clipboard"
                     "x-special/mate-copied-files"))
       (setq lines (cdr lines)))
     (when (member (car lines) '("copy" "cut"))
-      (dired-clipboard--parse-uri-list
-       (mapconcat #'identity (cdr lines) "\n")))))
+      (list :operation (intern (car lines))
+            :files (dired-clipboard--parse-uri-list
+                    (mapconcat #'identity (cdr lines) "\n"))))))
+
+(defun dired-clipboard--parse-copied-files (text)
+  "Return local file names from copy/cut plus file URI clipboard TEXT."
+  (plist-get (dired-clipboard--parse-copied-files-content text) :files))
 
 (defun dired-clipboard--parse-path-list (text)
   "Return absolute file names from newline-separated TEXT."
@@ -560,9 +589,44 @@ GNOME/Nautilus-style targets, including Caja's MATE target."
       (when-let ((existing (dired-clipboard--existing-files files)))
         (throw 'files existing)))))
 
-(defun dired-clipboard--file-clipboard-payload (files)
+(defun dired-clipboard--existing-clipboard-content (content)
+  "Return CONTENT with only existing files, or nil when none exist."
+  (when-let ((files (dired-clipboard--existing-files
+                     (plist-get content :files))))
+    (plist-put (copy-sequence content) :files files)))
+
+(defun dired-clipboard--first-existing-clipboard-content (&rest candidates)
+  "Return the first clipboard content with existing files."
+  (catch 'content
+    (dolist (content candidates)
+      (when-let ((existing
+                  (dired-clipboard--existing-clipboard-content content)))
+        (throw 'content existing)))))
+
+(defun dired-clipboard--clipboard-content (files &optional operation)
+  "Return a clipboard content plist for FILES and OPERATION."
+  (list :operation (or operation 'copy)
+        :files files))
+
+(defun dired-clipboard--operation-from-text (text)
+  "Return clipboard operation recorded on TEXT, or `copy'."
+  (or (and (stringp text)
+           (> (length text) 0)
+           (get-text-property 0 'dired-clipboard-operation text))
+      'copy))
+
+(defun dired-clipboard--content-with-text-operation (content text-files text)
+  "Return CONTENT, using TEXT's operation when it describes TEXT-FILES."
+  (if (and (eq (dired-clipboard--operation-from-text text) 'cut)
+           (equal (plist-get content :files) text-files))
+      (plist-put (copy-sequence content) :operation 'cut)
+    content))
+
+(defun dired-clipboard--file-clipboard-payload (files &optional operation)
   "Return a file clipboard payload plist for FILES."
-  (let* ((text (mapconcat #'identity files "\n"))
+  (let* ((operation (or operation 'copy))
+         (operation-name (symbol-name operation))
+         (text (mapconcat #'identity files "\n"))
          (local-files (dired-clipboard--local-files files))
          (local-uris (dired-clipboard--uris-for-files local-files))
          (uri-list (when local-uris
@@ -570,8 +634,13 @@ GNOME/Nautilus-style targets, including Caja's MATE target."
          (copied-files-list
           (when local-uris
             ;; Nautilus rejects empty lines in this MIME payload.
-            (concat "copy\n" (mapconcat #'identity local-uris "\n"))))
+            (concat operation-name "\n"
+                    (mapconcat #'identity local-uris "\n"))))
          (selection (copy-sequence text)))
+    (add-text-properties
+     0 (length text)
+     `(dired-clipboard-operation ,operation)
+     text)
     (when local-uris
       (dired-clipboard--install-selection-converters)
       (add-text-properties
@@ -580,7 +649,8 @@ GNOME/Nautilus-style targets, including Caja's MATE target."
                        x-special/gnome-copied-files ,copied-files-list
                        x-special/mate-copied-files ,copied-files-list)
        selection))
-    (list :files files
+    (list :operation operation
+          :files files
           :text text
           :local-files local-files
           :local-uris local-uris
@@ -598,6 +668,7 @@ GNOME/Nautilus-style targets, including Caja's MATE target."
   (let ((handler (plist-get (cdr definition)
                             (pcase operation
                               ('copy :copy)
+                              ('paste-content :paste-content)
                               ('paste :paste)))))
     (and (functionp handler) handler)))
 
@@ -623,6 +694,7 @@ GNOME/Nautilus-style targets, including Caja's MATE target."
              definition operation payload)
         (pcase operation
           ('copy (funcall handler payload))
+          ('paste-content (funcall handler))
           ('paste (funcall handler)))))))
 
 (defun dired-clipboard--copy-with-file-backends (payload)
@@ -633,36 +705,71 @@ Return the backend name that claimed the clipboard."
       (when (dired-clipboard--call-file-clipboard-backend name 'copy payload)
         (throw 'backend name)))))
 
-(defun dired-clipboard--files-from-file-backends ()
-  "Return files from the first backend with existing paths."
-  (catch 'files
+(defun dired-clipboard--content-from-file-backends ()
+  "Return clipboard content from the first backend with existing paths."
+  (catch 'content
     (dolist (name dired-clipboard-file-clipboard-backends)
+      (when-let ((content
+                  (dired-clipboard--existing-clipboard-content
+                   (dired-clipboard--call-file-clipboard-backend
+                    name 'paste-content))))
+        (throw 'content content))
       (when-let ((files
                   (dired-clipboard--existing-files
                    (dired-clipboard--call-file-clipboard-backend
                     name 'paste))))
-        (throw 'files files)))))
+        (throw 'content (dired-clipboard--clipboard-content files))))))
+
+(defun dired-clipboard--files-from-file-backends ()
+  "Return files from the first backend with existing paths."
+  (plist-get (dired-clipboard--content-from-file-backends) :files))
 
 (defun dired-clipboard--windows-backend-available-p (operation _payload)
   "Return non-nil if the Windows backend can handle OPERATION."
-  (and (memq operation '(copy paste))
+  (and (memq operation '(copy paste paste-content))
        dired-clipboard-use-native-file-clipboard
        (eq system-type 'windows-nt)
        (dired-clipboard--powershell-program)))
 
-(defun dired-clipboard--set-windows-file-clipboard (files)
-  "Set the Windows Explorer file clipboard to FILES."
+(defun dired-clipboard--windows-drop-effect (operation)
+  "Return the Windows DROPEFFECT value for OPERATION."
+  (if (eq operation 'cut) 2 1))
+
+(defun dired-clipboard--windows-operation-from-drop-effect (effect)
+  "Return the clipboard operation represented by Windows DROPEFFECT."
+  (if (and effect
+           (not (zerop (logand effect 2))))
+      'cut
+    'copy))
+
+(defun dired-clipboard--windows-drop-effect-from-output (output)
+  "Return the Windows DROPEFFECT marker from OUTPUT, or nil."
+  (when (stringp output)
+    (catch 'effect
+      (dolist (line (dired-clipboard--lines output))
+        (when (string-match "\\`__DROPEFFECT:\\([0-9]+\\)\\'" line)
+          (throw 'effect (string-to-number (match-string 1 line))))))))
+
+(defun dired-clipboard--set-windows-file-clipboard (files &optional operation)
+  "Set the Windows Explorer file clipboard to FILES.
+OPERATION is either `copy' or `cut'."
   (when (and dired-clipboard-use-native-file-clipboard
              (eq system-type 'windows-nt)
              files)
     (dired-clipboard--call-powershell
      dired-clipboard--windows-set-file-drop-script
-     (dired-clipboard--base64-lines files))))
+     (concat "effect="
+             (number-to-string
+              (dired-clipboard--windows-drop-effect operation))
+             "\n"
+             (dired-clipboard--base64-lines files)))))
 
 (defun dired-clipboard--copy-windows-file-clipboard (payload)
   "Copy PAYLOAD to the Windows Explorer file clipboard."
   (when-let ((files (plist-get payload :local-files)))
-    (dired-clipboard--set-windows-file-clipboard files)))
+    (dired-clipboard--set-windows-file-clipboard
+     files
+     (plist-get payload :operation))))
 
 (defun dired-clipboard--windows-files-from-clipboard ()
   "Return file names from the Windows Explorer file clipboard."
@@ -671,6 +778,17 @@ Return the backend name that claimed the clipboard."
     (when-let ((output (dired-clipboard--call-powershell
                         dired-clipboard--windows-get-file-drop-script)))
       (dired-clipboard--decode-base64-lines output))))
+
+(defun dired-clipboard--windows-content-from-clipboard ()
+  "Return clipboard content from the Windows Explorer file clipboard."
+  (when (and dired-clipboard-use-native-file-clipboard
+             (eq system-type 'windows-nt))
+    (when-let ((output (dired-clipboard--call-powershell
+                        dired-clipboard--windows-get-file-drop-script)))
+      (dired-clipboard--clipboard-content
+       (dired-clipboard--decode-base64-lines output)
+       (dired-clipboard--windows-operation-from-drop-effect
+        (dired-clipboard--windows-drop-effect-from-output output))))))
 
 (defun dired-clipboard--macos-backend-available-p (operation _payload)
   "Return non-nil if the macOS backend can handle OPERATION."
@@ -705,24 +823,34 @@ Return the backend name that claimed the clipboard."
 
 (defun dired-clipboard--files-from-clipboard ()
   "Return existing files/directories represented by the clipboard."
-  (let* ((backend-files (dired-clipboard--files-from-file-backends))
+  (plist-get (dired-clipboard--content-from-clipboard) :files))
+
+(defun dired-clipboard--content-from-clipboard ()
+  "Return clipboard content represented by the clipboard."
+  (let* ((backend-content (dired-clipboard--content-from-file-backends))
          (gnome (dired-clipboard--selection 'x-special/gnome-copied-files))
          (mate (dired-clipboard--selection 'x-special/mate-copied-files))
          (uri-list (dired-clipboard--selection 'text/uri-list))
          (text (or (dired-clipboard--selection 'UTF8_STRING)
                    (dired-clipboard--selection 'STRING)
-                   (dired-clipboard--current-kill))))
-    (dired-clipboard--first-existing-files
-     backend-files
-     (dired-clipboard--parse-copied-files gnome)
-     (dired-clipboard--parse-copied-files mate)
-     (dired-clipboard--parse-copied-files text)
-     (dired-clipboard--parse-uri-list uri-list)
-     (dired-clipboard--parse-path-list text))))
+                   (dired-clipboard--current-kill)))
+         (text-files (dired-clipboard--parse-path-list text)))
+    (dired-clipboard--first-existing-clipboard-content
+     (dired-clipboard--content-with-text-operation
+      backend-content text-files text)
+     (dired-clipboard--parse-copied-files-content gnome)
+     (dired-clipboard--parse-copied-files-content mate)
+     (dired-clipboard--parse-copied-files-content text)
+     (dired-clipboard--clipboard-content
+      (dired-clipboard--parse-uri-list uri-list))
+     (dired-clipboard--clipboard-content
+      text-files
+      (dired-clipboard--operation-from-text text)))))
 
-(defun dired-clipboard--copy-files (files)
-  "Copy FILES to the kill ring and system clipboard."
-  (let* ((payload (dired-clipboard--file-clipboard-payload files))
+(defun dired-clipboard--copy-files (files &optional operation)
+  "Copy FILES to the kill ring and system clipboard.
+OPERATION is either `copy' or `cut'."
+  (let* ((payload (dired-clipboard--file-clipboard-payload files operation))
          (text (plist-get payload :text))
          (selection (plist-get payload :selection))
          (clipboard-owned
@@ -742,7 +870,7 @@ Return the backend name that claimed the clipboard."
 (defun dired-clipboard--ensure-not-wdired ()
   "Signal an error when called from WDired."
   (when (derived-mode-p 'wdired-mode)
-    (user-error "M-w/C-y are disabled while editing Dired entries")))
+    (user-error "M-w/C-w/C-y are disabled while editing Dired entries")))
 
 (defun dired-clipboard--region-active-p ()
   "Return non-nil when a non-empty region is active."
@@ -803,23 +931,43 @@ Return the backend name that claimed the clipboard."
   "Paste files/directories represented by the clipboard into Dired."
   (interactive nil dired-mode)
   (dired-clipboard--ensure-not-wdired)
-  (let ((files (dired-clipboard--files-from-clipboard))
-        (target (file-name-as-directory (dired-current-directory)))
-        (dired-recursive-copies dired-clipboard-recursive-copies))
+  (let* ((content (dired-clipboard--content-from-clipboard))
+         (files (plist-get content :files))
+         (operation (plist-get content :operation))
+         (move-p (eq operation 'cut))
+         (create-function (if move-p #'dired-rename-file #'dired-copy-file))
+         (description (if move-p "Move" "Paste"))
+         (target (file-name-as-directory (dired-current-directory)))
+         (dired-recursive-copies dired-clipboard-recursive-copies))
     (unless files
       (user-error "Clipboard does not contain pasteable files or directories"))
     (dired-create-files
-     #'dired-copy-file
-     "Paste"
+     create-function
+     description
      files
      (lambda (from)
        (dired-clipboard--paste-destination from target))
      dired-clipboard-keep-marker)))
 
+;;;###autoload
+(defun dired-clipboard-cut ()
+  "Cut marked Dired files/directories, or current file, to the clipboard."
+  (interactive nil dired-mode)
+  (dired-clipboard--ensure-not-wdired)
+  (when (dired-clipboard--region-active-p)
+    (user-error "Dired file cut is disabled while the region is active"))
+  (let ((files (dired-get-marked-files
+                nil nil nil nil
+                "No file at point")))
+    (dired-clipboard--copy-files files 'cut)
+    (message "%d item%s cut to clipboard"
+             (length files)
+             (if (= (length files) 1) "" "s"))))
+
 (defun dired-clipboard--disabled-in-wdired ()
   "Disable file clipboard commands while editing Dired entries."
   (interactive)
-  (user-error "M-w/C-y are disabled while editing Dired entries"))
+  (user-error "M-w/C-w/C-y are disabled while editing Dired entries"))
 
 (defun dired-clipboard--copy-key-binding (&optional _)
   "Return the M-w binding for the current Dired state."
@@ -827,6 +975,13 @@ Return the backend name that claimed the clipboard."
           (dired-clipboard--region-active-p))
       nil
     #'dired-clipboard-copy))
+
+(defun dired-clipboard--cut-key-binding (&optional _)
+  "Return the C-w binding for the current Dired state."
+  (if (or (derived-mode-p 'wdired-mode)
+          (dired-clipboard--region-active-p))
+      nil
+    #'dired-clipboard-cut))
 
 (defun dired-clipboard--paste-key-binding (&optional _)
   "Return the C-y binding for the current Dired state."
@@ -838,6 +993,8 @@ Return the backend name that claimed the clipboard."
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "M-w")
                 `(menu-item "" nil :filter ,#'dired-clipboard--copy-key-binding))
+    (define-key map (kbd "C-w")
+                `(menu-item "" nil :filter ,#'dired-clipboard--cut-key-binding))
     (define-key map (kbd "C-y")
                 `(menu-item "" nil :filter ,#'dired-clipboard--paste-key-binding))
     map)
@@ -845,7 +1002,7 @@ Return the backend name that claimed the clipboard."
 
 ;;;###autoload
 (define-minor-mode dired-clipboard-mode
-  "Use M-w/C-y to copy and paste files in Dired."
+  "Use M-w/C-w/C-y to copy, cut and paste files in Dired."
   :lighter nil
   :keymap dired-clipboard-mode-map)
 
@@ -853,6 +1010,9 @@ Return the backend name that claimed the clipboard."
   (when (eq (lookup-key wdired-mode-map (kbd "M-w"))
             #'dired-clipboard--disabled-in-wdired)
     (define-key wdired-mode-map (kbd "M-w") nil))
+  (when (eq (lookup-key wdired-mode-map (kbd "C-w"))
+            #'dired-clipboard--disabled-in-wdired)
+    (define-key wdired-mode-map (kbd "C-w") nil))
   (when (eq (lookup-key wdired-mode-map (kbd "C-y"))
             #'dired-clipboard--disabled-in-wdired)
     (define-key wdired-mode-map (kbd "C-y") nil)))
