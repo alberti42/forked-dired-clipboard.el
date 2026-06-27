@@ -145,7 +145,8 @@ powershell, pwsh.exe and pwsh."
      :label "macOS Finder NSPasteboard"
      :available dired-clipboard--macos-backend-available-p
      :copy dired-clipboard--copy-macos-file-clipboard
-     :paste dired-clipboard--macos-files-from-clipboard)
+     :paste dired-clipboard--macos-files-from-clipboard
+     :paste-content dired-clipboard--macos-content-from-clipboard)
     (wayland
      :label "Wayland wl-copy"
      :available dired-clipboard--wayland-backend-available-p
@@ -228,15 +229,26 @@ use framework \"Foundation\"
 use scripting additions
 
 on run argv
+  set op to item 1 of argv
+  set fileArgs to rest of argv
   set pbItems to current application's NSMutableArray's array()
   set paths to current application's NSMutableArray's array()
-  repeat with filePath in argv
+  set firstItem to missing value
+  repeat with filePath in fileArgs
     set fileURL to current application's NSURL's fileURLWithPath:(contents of filePath)
     set pbItem to current application's NSPasteboardItem's alloc()'s init()
     (pbItem's setString:(fileURL's absoluteString()) forType:(current application's NSPasteboardTypeFileURL))
+    if firstItem is missing value then set firstItem to pbItem
     (pbItems's addObject:pbItem)
     (paths's addObject:(contents of filePath))
   end repeat
+
+  -- macOS has no native copy/cut distinction on the pasteboard, so record it
+  -- in a private type (the analog of Windows' Preferred DropEffect).  Stored
+  -- on the first item; read back by dired-clipboard--macos-content-from-clipboard.
+  if firstItem is not missing value then
+    (firstItem's setString:op forType:\"org.gnu.emacs.dired-clipboard.operation\")
+  end if
 
   set pasteboard to current application's NSPasteboard's generalPasteboard()
   pasteboard's clearContents()
@@ -250,9 +262,11 @@ on run argv
   (pasteboard's pasteboardItems()'s |count|())
 end run"
   "AppleScriptObjC script that sets macOS file URLs on NSPasteboard.
-Writes one public.file-url item per file (for Finder and modern apps) plus
-a legacy NSFilenamesPboardType property list, then forces synchronization so
-all items survive after osascript exits.")
+The first argument is the operation name (\"copy\" or \"cut\"); the remaining
+arguments are the file paths.  Writes one public.file-url item per file (for
+Finder and modern apps), a legacy NSFilenamesPboardType property list, and a
+private operation marker, then forces synchronization so all items survive
+after osascript exits.")
 
 (defconst dired-clipboard--macos-get-file-urls-script
   "use framework \"AppKit\"
@@ -273,6 +287,29 @@ if (urls's |count|()) is 0 then return \"\"
 -- pastes lose all but one file.
 return ((urls's valueForKey:\"path\")'s componentsJoinedByString:linefeed) as text"
   "AppleScriptObjC script that prints macOS file URLs from NSPasteboard.")
+
+(defconst dired-clipboard--macos-get-content-script
+  "use framework \"AppKit\"
+use framework \"Foundation\"
+use scripting additions
+
+set pasteboard to current application's NSPasteboard's generalPasteboard()
+set op to pasteboard's stringForType:\"org.gnu.emacs.dired-clipboard.operation\"
+if op is missing value then set op to \"\"
+set header to \"operation:\" & op
+set urlClass to current application's NSURL's class
+set urlClasses to current application's NSArray's arrayWithObject:urlClass
+set fileOnly to current application's NSNumber's numberWithBool:true
+set options to current application's NSDictionary's dictionaryWithObject:fileOnly forKey:(current application's NSPasteboardURLReadingFileURLsOnlyKey)
+set urls to pasteboard's readObjectsForClasses:urlClasses options:options
+if urls is missing value then return header
+if (urls's |count|()) is 0 then return header
+set pathText to ((urls's valueForKey:\"path\")'s componentsJoinedByString:linefeed) as text
+return header & linefeed & pathText"
+  "AppleScriptObjC script that prints the macOS clipboard operation and files.
+The first output line is \"operation:copy\" or \"operation:cut\" (empty when no
+operation marker is present, e.g. files copied in Finder); the remaining lines
+are the file paths.")
 
 (defun dired-clipboard--call-process (program input &rest args)
   "Run PROGRAM with ARGS and optional INPUT, returning stdout on success."
@@ -804,25 +841,31 @@ OPERATION is either `copy' or `cut'."
 
 (defun dired-clipboard--macos-backend-available-p (operation _payload)
   "Return non-nil if the macOS backend can handle OPERATION."
-  (and (memq operation '(copy paste))
+  (and (memq operation '(copy paste paste-content))
        dired-clipboard-use-native-file-clipboard
        (eq system-type 'darwin)
        (executable-find dired-clipboard-osascript-program)))
 
-(defun dired-clipboard--set-macos-file-clipboard (files)
-  "Set the macOS Finder file clipboard to FILES."
+(defun dired-clipboard--set-macos-file-clipboard (files &optional operation)
+  "Set the macOS Finder file clipboard to FILES.
+OPERATION is either `copy' or `cut' and is recorded in a private
+pasteboard marker so that `dired-clipboard-paste' can move instead of
+copy.  macOS has no native cut concept, so external apps such as Finder
+ignore the marker and always paste a copy."
   (when (and dired-clipboard-use-native-file-clipboard
              (eq system-type 'darwin)
              files
              (executable-find dired-clipboard-osascript-program))
     (apply #'dired-clipboard--call-osascript
            dired-clipboard--macos-set-file-urls-script
+           (symbol-name (or operation 'copy))
            files)))
 
 (defun dired-clipboard--copy-macos-file-clipboard (payload)
   "Copy PAYLOAD to the macOS Finder file clipboard."
   (when-let ((files (plist-get payload :local-files)))
-    (dired-clipboard--set-macos-file-clipboard files)))
+    (dired-clipboard--set-macos-file-clipboard
+     files (plist-get payload :operation))))
 
 (defun dired-clipboard--macos-files-from-clipboard ()
   "Return file names from the macOS Finder file clipboard."
@@ -832,6 +875,26 @@ OPERATION is either `copy' or `cut'."
     (when-let ((output (dired-clipboard--call-osascript
                         dired-clipboard--macos-get-file-urls-script)))
       (dired-clipboard--lines output))))
+
+(defun dired-clipboard--macos-content-from-clipboard ()
+  "Return clipboard content from the macOS Finder file clipboard.
+The returned plist carries the recorded `copy'/`cut' operation; files
+placed by an external app without the marker default to `copy'."
+  (when (and dired-clipboard-use-native-file-clipboard
+             (eq system-type 'darwin)
+             (executable-find dired-clipboard-osascript-program))
+    (when-let ((output (dired-clipboard--call-osascript
+                        dired-clipboard--macos-get-content-script)))
+      (let* ((lines (dired-clipboard--lines output))
+             (header (car lines))
+             (files (cdr lines))
+             (operation
+              (if (and (stringp header)
+                       (string= header "operation:cut"))
+                  'cut
+                'copy)))
+        (when files
+          (dired-clipboard--clipboard-content files operation))))))
 
 (defun dired-clipboard--files-from-clipboard ()
   "Return existing files/directories represented by the clipboard."
