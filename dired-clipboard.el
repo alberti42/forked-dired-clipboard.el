@@ -228,18 +228,31 @@ use framework \"Foundation\"
 use scripting additions
 
 on run argv
-  set urls to current application's NSMutableArray's array()
+  set pbItems to current application's NSMutableArray's array()
+  set paths to current application's NSMutableArray's array()
   repeat with filePath in argv
-    set nsPath to current application's NSString's stringWithString:(contents of filePath)
-    set fileURL to current application's NSURL's fileURLWithPath:nsPath
-    (urls's addObject:fileURL)
+    set fileURL to current application's NSURL's fileURLWithPath:(contents of filePath)
+    set pbItem to current application's NSPasteboardItem's alloc()'s init()
+    (pbItem's setString:(fileURL's absoluteString()) forType:(current application's NSPasteboardTypeFileURL))
+    (pbItems's addObject:pbItem)
+    (paths's addObject:(contents of filePath))
   end repeat
 
   set pasteboard to current application's NSPasteboard's generalPasteboard()
   pasteboard's clearContents()
-  if not (pasteboard's writeObjects:urls) then error \"NSPasteboard writeObjects failed\"
+  if not (pasteboard's writeObjects:pbItems) then error \"NSPasteboard writeObjects failed\"
+  pasteboard's setPropertyList:paths forType:(current application's NSFilenamesPboardType)
+  -- Force pasteboardd to materialize every item before this short-lived
+  -- process exits.  Without this read-back, writeObjects: registers each
+  -- NSURL as a promised provider tied to the osascript process and drops a
+  -- random subset of items when the process exits, so copying several files
+  -- pastes only one or two of them.
+  (pasteboard's pasteboardItems()'s |count|())
 end run"
-  "AppleScriptObjC script that sets macOS file URLs on NSPasteboard.")
+  "AppleScriptObjC script that sets macOS file URLs on NSPasteboard.
+Writes one public.file-url item per file (for Finder and modern apps) plus
+a legacy NSFilenamesPboardType property list, then forces synchronization so
+all items survive after osascript exits.")
 
 (defconst dired-clipboard--macos-get-file-urls-script
   "use framework \"AppKit\"
@@ -248,18 +261,17 @@ use scripting additions
 
 set pasteboard to current application's NSPasteboard's generalPasteboard()
 set urlClass to current application's NSURL's class
-set classes to current application's NSArray's arrayWithObject:urlClass
+set urlClasses to current application's NSArray's arrayWithObject:urlClass
 set fileOnly to current application's NSNumber's numberWithBool:true
 set options to current application's NSDictionary's dictionaryWithObject:fileOnly forKey:(current application's NSPasteboardURLReadingFileURLsOnlyKey)
-set urls to pasteboard's readObjectsForClasses:classes options:options
+set urls to pasteboard's readObjectsForClasses:urlClasses options:options
 if urls is missing value then return \"\"
-
-set paths to {}
-repeat with fileURL in urls
-  set end of paths to (fileURL's |path|()) as text
-end repeat
-set AppleScript's text item delimiters to linefeed
-return paths as text"
+if (urls's |count|()) is 0 then return \"\"
+-- Extract paths with NSArray methods only.  Coercing a bridged NSArray with
+-- `as list' or walking it with `repeat with x in urls' treats it as a single
+-- opaque object and silently returns just the first element, so multi-file
+-- pastes lose all but one file.
+return ((urls's valueForKey:\"path\")'s componentsJoinedByString:linefeed) as text"
   "AppleScriptObjC script that prints macOS file URLs from NSPasteboard.")
 
 (defun dired-clipboard--call-process (program input &rest args)
