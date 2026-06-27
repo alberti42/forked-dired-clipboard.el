@@ -111,7 +111,11 @@ by desktop file managers.  When ~wl-copy~ is available,
 
 * Limitations
 
-The main target is local files that Emacs can access directly.
+** TRAMP and remote desktops
+
+The main target is local files that Emacs can access directly.  For predictable
+behavior, use this package for local Dired buffers and local desktop file
+managers.
 
 TRAMP files and remote desktop file clipboard sharing are not general-purpose
 file transfer mechanisms.  In remote desktop sessions, copied file paths often
@@ -119,17 +123,30 @@ refer to the remote desktop filesystem rather than the filesystem visible to the
 Emacs process.  ~dired-clipboard~ therefore treats remote desktop integration as
 best-effort and does not try to provide transparent remote file transfer.
 
-For predictable behavior, use this package for local Dired buffers and local
-desktop file managers.
+** Windows
 
 On Windows, Explorer cut/copy state is represented with ~Preferred DropEffect~,
 so Explorer-to-Dired and Dired-to-Explorer move operations can work when the
 target application honors that clipboard metadata.
 
-On macOS, Finder exposes file URLs on the pasteboard but does not provide the
-same general-purpose cut marker used by Windows Explorer or GNOME/MATE file
-managers.  Dired-to-Dired ~C-w~ still moves files, while Finder interoperability
-uses the standard file URL pasteboard behavior.
+** macOS
+
+On macOS the pasteboard has no source-side cut/move flag, unlike Windows
+Explorer's ~Preferred DropEffect~ or the GNOME/MATE copy/cut markers.  This
+package records the chosen operation in a private pasteboard type, so
+Dired-to-Dired ~C-w~ followed by ~C-y~ still moves the files.
+
+Other applications, including Finder, cannot see that private marker, and macOS
+offers no way for the *source* of a clipboard to request a move.  On macOS the
+copy-vs-move decision for a paste is made by the *receiver* at paste time, not
+by the source when the files were marked.  macOS users should expect this:
+
+- Pasting Emacs-clipboard files into Finder with ~Cmd-V~ always *copies* them,
+  whether you used ~M-w~ or ~C-w~ in Dired.
+- To *move* them into a Finder folder, use Finder's own ~Option-Cmd-V~
+  ("Move Items Here").  It moves whatever files are on the clipboard and works
+  because the files are present as file URLs; it does not depend on, and is not
+  affected by, the Dired cut marker.
 
 * License
 
